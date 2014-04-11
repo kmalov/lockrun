@@ -1,63 +1,178 @@
+#!/bin/env python
+
 import optparse
-import signal
 import threading
-import syslog
 import time
+import sys
 import os
 import re
 
+from signal import SIGTERM
+from syslog import syslog, LOG_WARNING, LOG_NOTICE
 
-def find_process(first_pid, process):
-    # Find a process in /proc
-    process = re.sub(" +", " ", process).strip()
-    m = re.compile("^[0-9]+$")
-    all_proc = [ x for x in os.listdir("/proc") if m.search(x)]
-    for p in all_proc[all_proc.index(str(first_pid)):]:
-        try:
-            with open("/proc/%s/cmdline" % p, "r") as f:
-                cmdline = f.readline().replace("\x00", " ").rstrip('\n').strip()
-                if process == cmdline:
-                    return int(p)
-        except IOError:
-            pass
+
+def compare_processes_cmd(process_cmd, pid):
+    process_cmd = re.sub(" +", " ", process_cmd).strip()
+    try:
+        with open("/proc/%s/cmdline" % pid, "r") as f:
+            cmdline = f.readline().replace("\x00", " ").rstrip('\n').strip()
+            if process_cmd == cmdline:
+                return True
+            else:
+                return False
+    except IOError:
+        return False
+
+
+def find_process_pid(process_cmd, start_from_pid=300):
+    """
+    Min pid is 300 from kernel/pid.c, see RESERVED_PIDS
+    """
+    # Find all active processes
+    m = re.compile(r"^[0-9]+$")
+    all_processes = [x for x in os.listdir("/proc") if m.search(x) and x >= start_from_pid]
+
+    # Find our process
+    for p in all_processes:
+        if compare_processes_cmd(process_cmd, p):
+            return int(p)
 
     return False
 
-def process_watcher(child_process, parent_pid, timeout):
 
-    child_pid = find_process(parent_pid, child_process)
+def get_cmdline_by_pid(pid):
+    try:
+        with open("/proc/%s/cmdline" % pid, "r") as f:
+            return f.readline().replace("\x00", " ").rstrip('\n').strip()
+    except IOError:
+        return False
 
+
+def get_pid_from_lockfile(lockfile):
+    try:
+        with open(lockfile, "r") as f:
+            pid = f.readline().rstrip('\n').strip()
+            if not re.search(r"^[0-9]+$", pid):
+                return False
+            else:
+                return int(pid)
+    except IOError:
+        return False
+
+
+def process_watcher(process_cmd, parent_pid):
+    child_pid = find_process_pid(process_cmd, parent_pid)
     if child_pid:
-        syslog.syslog(syslog.LOG_WARNING,
-                      """Trying to kill process "%s"[%s] by timeout(%ss)"""
-                      % (child_process, child_pid, timeout))
-
-        os.kill(child_pid, signal.SIGTERM)
+        os.kill(child_pid, SIGTERM)
+        syslog(LOG_WARNING,
+               """Trying to kill process "%s"[%s] by timeout""" % (process_cmd, parent_pid))
     else:
-        syslog.syslog(syslog.LOG_WARNING,
-                      """Can't find task process "%s" in /proc""" % child_process)
+        syslog(LOG_WARNING,
+               """Can't find process "%s" pid to kill it by timeout""" % process_cmd)
+
+
+def is_locked(process_cmd, lockfile):
+    # No lockfile
+    if not os.path.exists(lockfile):
+        return False
+
+    # lockfile exists, but no pid
+    pid = get_pid_from_lockfile(lockfile)
+    if not pid:
+        return False
+
+    # Check pid in proc
+    if not os.path.exists("/proc/%s" % pid):
+        return False
+
+    # Process cmd in /proc mismatch with new task cmd
+    if not compare_processes_cmd(process_cmd, pid):
+        return False
+
+    return True
+
+
+def log_msg(log_level, msg):
+    if log_level == LOG_NOTICE:
+        out = sys.stdout
+    else:
+        out = sys.stderr
+
+    out.write("%s\n" % msg)
+    syslog(log_level, msg)
 
 
 if __name__ == "__main__":
 
     op = optparse.OptionParser()
-    op.add_option("-P", "--program", dest="program", default=False, type="string")
-    op.add_option("-p", "--lockfile", dest="lockfile", default=False, type="string")
-    op.add_option("-t", "--timeout", dest="timeout", default=False, type="int")
+    op.set_usage("%s -t TASK -l LOCKFILE [-T TIMEOUT|-k|-v]" % sys.argv[0])
+
+    op.add_option("-t", "--task", dest="task",
+                  default=False, type="string",
+                  help="Task command to run")
+    op.add_option("-l", "--lockfile", dest="lockfile",
+                  default=False, type="string",
+                  help="Path to lockfile")
+    op.add_option("-T", "--timeout", dest="timeout",
+                  default=False, type="int",
+                  help="Set timeout to kill task after timeout")
+    op.add_option("-k", "--kill", dest="kill",
+                  default=False, action="store_true",
+                  help="Try to kill previous task before starting new task")
+    op.add_option("-v", "--verbose", dest="verbose",
+                  default=False, action="store_true",
+                  help="Add more debug messages to syslog")
 
     opts, args = op.parse_args()
 
+    if not opts.lockfile and not opts.task:
+        op.print_help()
+        sys.exit(1)
+
+    # Handle locks
+    if opts.lockfile:
+        self_process_cmd = get_cmdline_by_pid(os.getpid())
+        self_pid = os.getpid()
+
+        # Check for lock
+        if is_locked(self_process_cmd, opts.lockfile):
+            if opts.kill:
+                pid = get_pid_from_lockfile(opts.lockfile)
+                if pid:
+                    log_msg(LOG_WARNING, """Try to kill previous task with pid %s""" % pid)
+                    os.kill(pid, SIGTERM)
+            else:
+                log_msg(LOG_WARNING, """Previous process is still running""")
+                sys.exit(1)
+
+        # Set lock
+        try:
+            with open(opts.lockfile, "w") as f:
+                f.write("%s\n" % self_pid)
+        except IOError as e:
+            log_msg(LOG_WARNING, """"Can't set lockfile %s: %s""" % (opts.lockfile, e))
+            sys.exit(1)
+
     if opts.timeout:
-        watcher = threading.Timer(opts.timeout, process_watcher, [opts.program, os.getpid(), opts.timeout])
+        watcher = threading.Timer(opts.timeout, process_watcher, [opts.task, os.getpid()])
         watcher.start()
 
     # Run program
     start_time = time.time()
-    return_code = os.system(opts.program)
-    total_tile = time.time() - start_time
+    return_code = os.system(opts.task)
+    total_time = time.time() - start_time
 
     if opts.timeout:
         watcher.cancel()
 
-    syslog.syslog(syslog.LOG_NOTICE,
-                  """Command "%s" is done with return code: %s. Execution time %.2fs""" % (opts.program, return_code, total_tile))
+    if return_code != 0 or opts.verbose:
+        log_msg(LOG_NOTICE,
+                """Command "%s" is done with return code: %s. Execution time %.2fs"""
+                % (opts.task, return_code, total_time))
+
+    if opts.lockfile:
+        try:
+            os.remove(opts.lockfile)
+        except OSError as e:
+            log_msg(LOG_WARNING, "Can't remove lockfile %s: %s" %(opts.lockfile, e))
+
