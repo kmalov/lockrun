@@ -29,8 +29,7 @@ def find_process_pid(process_cmd, start_from_pid=300):
     Min pid is 300 from kernel/pid.c, see RESERVED_PIDS
     """
     # Find all active processes
-    m = re.compile(r"^[0-9]+$")
-    all_processes = [x for x in os.listdir("/proc") if m.search(x) and x >= start_from_pid]
+    all_processes = [d for d in os.listdir("/proc") if d.isdigit() and int(d) >= start_from_pid]
 
     # Find our process
     for p in all_processes:
@@ -52,10 +51,7 @@ def get_pid_from_lockfile(lockfile):
     try:
         with open(lockfile, "r") as f:
             pid = f.readline().rstrip('\n').strip()
-            if not re.search(r"^[0-9]+$", pid):
-                return False
-            else:
-                return int(pid)
+            return int(pid) if pid.isdigit() else False
     except IOError:
         return False
 
