@@ -41,8 +41,8 @@ def find_process_pid(process_cmd, start_from_pid=300):
 
 def get_cmdline_by_pid(pid):
     try:
-        with open("/proc/%s/cmdline" % pid, "r") as f:
-            return f.readline().replace("\x00", " ").rstrip('\n').strip()
+        with open("/proc/%s/cmdline" % pid, "r") as fh:
+            return fh.readline().replace("\x00", " ").rstrip('\n').strip()
     except IOError:
         return False
 
@@ -125,28 +125,41 @@ if __name__ == "__main__":
         op.print_help()
         sys.exit(1)
 
+    if opts.verbose:
+        log_msg("New lockrun task '%s' with options: lockfile = %s; timeout = %s; kill = %s" %
+                (opts.task, opts.lockfile, opts.timeout, opts.kill))
+
     # Handle locks
     if opts.lockfile:
-        self_process_cmd = get_cmdline_by_pid(os.getpid())
         self_pid = os.getpid()
+        self_process_cmd = get_cmdline_by_pid(self_pid)
+
+        if not self_process_cmd:
+            log_msg("ERROR: Can't find pid %s in /proc for task '%s'" % (self_pid, opts.task))
+            sys.exit(1)
 
         # Check for lock
         if is_locked(self_process_cmd, opts.lockfile):
             if opts.kill:
                 pid = get_pid_from_lockfile(opts.lockfile)
                 if pid:
-                    log_msg(LOG_WARNING, """Try to kill previous task with pid %s""" % pid)
+                    log_msg(LOG_WARNING, "Try to kill previous task '%s' with pid %s!" %
+                            (opts.task, pid))
                     os.kill(pid, SIGTERM)
             else:
-                log_msg(LOG_WARNING, """Previous process is still running""")
+                log_msg(LOG_WARNING, "Previous task '%s' is running. I'm done." % opts.task)
                 sys.exit(1)
+        else:
+            if opts.verbose:
+                log_msg("Can't find lock from previous task '%s'. Ready to start new task." % opts.task)
 
         # Set lock
         try:
             with open(opts.lockfile, "w") as f:
                 f.write("%s\n" % self_pid)
         except IOError as e:
-            log_msg(LOG_WARNING, """"Can't set lockfile %s: %s""" % (opts.lockfile, e))
+            log_msg(LOG_WARNING, "Can't set lockfile %s for task '%s': %s" %
+                    (opts.lockfile, opts.task, e))
             sys.exit(1)
 
     if opts.timeout:
@@ -163,12 +176,12 @@ if __name__ == "__main__":
 
     if return_code != 0 or opts.verbose:
         log_msg(LOG_NOTICE,
-                """Command "%s" is done with return code: %s. Execution time %.2fs"""
+                "Task '%s' is done with return code: %s. Execution time %.2fs"
                 % (opts.task, return_code, total_time))
 
     if opts.lockfile:
         try:
             os.remove(opts.lockfile)
         except OSError as e:
-            log_msg(LOG_WARNING, "Can't remove lockfile %s: %s" %(opts.lockfile, e))
-
+            log_msg(LOG_WARNING, "Can't remove lockfile %s for task '%s': %s" %
+                    (opts.lockfile, opts.task, e))
